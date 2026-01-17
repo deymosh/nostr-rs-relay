@@ -49,6 +49,8 @@ pub struct SqliteRepo {
     checkpoint_in_progress: Arc<Mutex<u64>>,
     /// Flag to limit writer concurrency
     write_in_progress: Arc<Mutex<u64>>,
+    // Flag to indicate if hide deleted events
+    hide_deleted_events: bool,
     /// Semaphore for readers to acquire blocking threads
     reader_threads_ready: Arc<Semaphore>,
 }
@@ -98,12 +100,13 @@ impl SqliteRepo {
             maint_pool,
             checkpoint_in_progress,
             write_in_progress,
+            hide_deleted_events: settings.database.hide_deleted_events,
             reader_threads_ready,
         }
     }
 
     /// Persist an event to the database, returning rows added.
-    pub fn persist_event(conn: &mut PooledConnection, e: &Event) -> Result<u64> {
+    pub fn persist_event(conn: &mut PooledConnection, e: &Event, hide_deleted_events: bool) -> Result<u64> {
         // enable auto vacuum
         conn.execute_batch("pragma auto_vacuum = FULL")?;
 
@@ -208,14 +211,25 @@ impl SqliteRepo {
                 .filter(|x| is_hex(x) && x.len() == 64)
                 .filter_map(|x| hex::decode(x).ok())
                 .for_each(|x| params.push(Box::new(x)));
-            let query = format!(
-                "UPDATE event SET hidden=TRUE WHERE kind!=5 AND author=? AND event_hash IN ({})",
-                repeat_vars(params.len() - 1)
-            );
+            let query;
+
+            if hide_deleted_events {
+                query = format!(
+                    "UPDATE event SET hidden=TRUE WHERE kind!=5 AND author=? AND event_hash IN ({})",
+                    repeat_vars(params.len() - 1)
+                );
+            } else {
+                query = format!(
+                    "DELETE FROM event WHERE kind!=5 AND author=? AND event_hash IN ({})",
+                    repeat_vars(params.len() - 1)
+                );
+            }
+
             let mut stmt = tx.prepare(&query)?;
             let update_count = stmt.execute(rusqlite::params_from_iter(params))?;
             info!(
-                "hid {} deleted events for author {:?}",
+                "{} {} events for author {:?}",
+                if hide_deleted_events { "hid" } else { "deleted" },
                 update_count,
                 e.get_author_prefix()
             );
@@ -276,6 +290,7 @@ impl NostrRepo for SqliteRepo {
         let max_write_attempts = 10;
         let mut attempts = 0;
         let _write_guard = self.write_in_progress.lock().await;
+        let hide_deleted_events = self.hide_deleted_events;
         // spawn a blocking thread
         //let mut conn = self.write_pool.get()?;
         let pool = self.write_pool.clone();
@@ -286,7 +301,7 @@ impl NostrRepo for SqliteRepo {
             // multiple times before giving up.
             loop {
                 attempts += 1;
-                let wr = SqliteRepo::persist_event(&mut conn, &e);
+                let wr = SqliteRepo::persist_event(&mut conn, &e, hide_deleted_events);
                 match wr {
                     Err(SqlError(rusqlite::Error::SqliteFailure(e, _))) => {
                         // this basically means that NIP-05 or another
